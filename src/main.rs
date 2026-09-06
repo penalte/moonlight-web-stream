@@ -211,6 +211,15 @@ fn enable_ansi_windows() {
 struct ActixDebugSpan;
 
 impl ActixDebugSpan {
+    fn sanitized_uri(request: &ServiceRequest) -> String {
+        let uri = request.uri();
+        if request.path().contains("/api/oidc/") {
+            uri.path().to_string()
+        } else {
+            uri.to_string()
+        }
+    }
+
     fn sanitize_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         const SENSITIVE: &[&str] = &["authorization", "cookie", "set-cookie"];
 
@@ -238,7 +247,7 @@ impl RootSpanBuilder for ActixDebugSpan {
                 Level::TRACE,
                 "http_request",
                 method = %request.method(),
-                uri = %request.uri(),
+                uri = %Self::sanitized_uri(request),
                 headers = ?Self::sanitize_headers(request.headers()),
                 peer_addr = ?request.peer_addr(),
             )
@@ -247,7 +256,7 @@ impl RootSpanBuilder for ActixDebugSpan {
                 Level::DEBUG,
                 "http_request",
                 method = %request.method(),
-                uri = %request.uri(),
+                uri = %Self::sanitized_uri(request),
             )
         }
     }

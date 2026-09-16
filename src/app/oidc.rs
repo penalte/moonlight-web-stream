@@ -245,8 +245,7 @@ pub async fn authorization_url(
             move || CsrfToken::new(state),
             move || Nonce::new(nonce),
         )
-        .set_pkce_challenge(code_challenge)
-        .add_scope(Scope::new("openid".to_string()));
+        .set_pkce_challenge(code_challenge);
 
     for scope in config
         .scopes

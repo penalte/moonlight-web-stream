@@ -79,4 +79,5 @@ todo = "warn"
 
 [dev-dependencies]
 # used only by the OIDC mock-IdP tests in src/app/oidc.rs (RSA JWT signing)
-openssl = "0.10"
+rsa = "0.9.10"
+rand = "0.8.6"

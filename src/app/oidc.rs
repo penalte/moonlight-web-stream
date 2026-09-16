@@ -411,6 +411,57 @@ fn random_urlsafe() -> Result<String, RustCryptoError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// True when `groups_claim` in the ID token contains `admin_group`.
+///
+/// Accepts either an array of strings (the usual shape, and what pocket-id
+/// emits) or a single string, since providers differ. A missing or malformed
+/// claim means "not an admin" rather than an error: losing the claim should
+/// demote, never break the login.
+pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &str) -> bool {
+    let Some(value) = claims.get(groups_claim) else {
+        return false;
+    };
+    match value {
+        Value::Array(groups) => groups
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|group| group == admin_group),
+        Value::String(group) => group == admin_group,
+        _ => false,
+    }
+}
+
+/// Adds the id token's non-standard claims back into `claims`.
+///
+/// openidconnect models the id token as `IdTokenClaims<AdditionalClaims, _>`
+/// and flattens anything it does not recognise into the additional-claims
+/// type. The core aliases use `EmptyAdditionalClaims`, so provider-specific
+/// entries such as `groups` are dropped when the typed claims are serialised,
+/// while standard ones like `preferred_username` survive.
+///
+/// Rather than re-parameterise every client type, this re-reads the payload of
+/// the token whose signature, audience and nonce were verified immediately
+/// above, so the extra entries carry the same trust as the typed ones. Existing
+/// keys are never overwritten: the verified typed claims win on conflict.
+fn merge_raw_id_token_claims(id_token: &CoreIdToken, mut claims: Value) -> Value {
+    let token = id_token.to_string();
+    let Some(payload) = token.split('.').nth(1) else {
+        return claims;
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return claims;
+    };
+    let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(&bytes) else {
+        return claims;
+    };
+    if let Value::Object(map) = &mut claims {
+        for (key, value) in raw {
+            map.entry(key).or_insert(value);
+        }
+    }
+    claims
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -422,11 +473,11 @@ mod tests {
     use crate::config::OidcConfig;
     use actix_web::{App as ActixApp, HttpResponse, HttpServer, web};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use openssl::{
-        hash::MessageDigest,
-        pkey::{PKey, Private},
-        rsa::Rsa,
-        sign::Signer,
+    use rsa::{
+        RsaPrivateKey,
+        pkcs1v15::SigningKey,
+        signature::{SignatureEncoding, Signer as _},
+        traits::PublicKeyParts,
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -440,7 +491,7 @@ mod tests {
     fn rs256_id_token(
         issuer: &str,
         client_id: &str,
-        signing_key: &PKey<Private>,
+        signing_key: &SigningKey<Sha256>,
         nonce: &str,
         subject: &str,
         access_token: &str,
@@ -466,13 +517,11 @@ mod tests {
             .expect("claims should serialize"),
         );
         let signing_input = format!("{header}.{payload}");
-        let mut signer =
-            Signer::new(MessageDigest::sha256(), signing_key).expect("RSA signer should build");
-        signer
-            .update(signing_input.as_bytes())
-            .expect("RSA input should be accepted");
-        let signature = signer.sign_to_vec().expect("RSA key should sign");
-        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+        let signature = signing_key.sign(signing_input.as_bytes());
+        format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
     }
 
     #[actix_web::test]
@@ -572,16 +621,17 @@ mod tests {
             listener.local_addr().expect("listener should have address")
         );
         let client_id = "moonlight-web".to_string();
-        let rsa = Rsa::generate(2048).expect("test RSA key should generate");
+        let private_key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
+            .expect("test RSA key should generate");
         let jwk = json!({
             "kty": "RSA",
             "use": "sig",
             "kid": "test-key",
             "alg": "RS256",
-            "n": URL_SAFE_NO_PAD.encode(rsa.n().to_vec()),
-            "e": URL_SAFE_NO_PAD.encode(rsa.e().to_vec())
+            "n": URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be())
         });
-        let signing_key = PKey::from_rsa(rsa).expect("test RSA key should import");
+        let signing_key = SigningKey::<Sha256>::new(private_key);
         let provider_issuer = issuer.clone();
         let provider_client_id = client_id.clone();
         let provider_jwk = jwk.clone();
@@ -935,55 +985,4 @@ mod tests {
             .issuer_url = "http://127.0.0.1:8080/realms/moonlight".to_string();
         validate_oidc_startup_config(&config).expect("loopback HTTP issuer should be allowed");
     }
-}
-
-/// True when `groups_claim` in the ID token contains `admin_group`.
-///
-/// Accepts either an array of strings (the usual shape, and what pocket-id
-/// emits) or a single string, since providers differ. A missing or malformed
-/// claim means "not an admin" rather than an error: losing the claim should
-/// demote, never break the login.
-pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &str) -> bool {
-    let Some(value) = claims.get(groups_claim) else {
-        return false;
-    };
-    match value {
-        Value::Array(groups) => groups
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|group| group == admin_group),
-        Value::String(group) => group == admin_group,
-        _ => false,
-    }
-}
-
-/// Adds the id token's non-standard claims back into `claims`.
-///
-/// openidconnect models the id token as `IdTokenClaims<AdditionalClaims, _>`
-/// and flattens anything it does not recognise into the additional-claims
-/// type. The core aliases use `EmptyAdditionalClaims`, so provider-specific
-/// entries such as `groups` are dropped when the typed claims are serialised,
-/// while standard ones like `preferred_username` survive.
-///
-/// Rather than re-parameterise every client type, this re-reads the payload of
-/// the token whose signature, audience and nonce were verified immediately
-/// above, so the extra entries carry the same trust as the typed ones. Existing
-/// keys are never overwritten: the verified typed claims win on conflict.
-fn merge_raw_id_token_claims(id_token: &CoreIdToken, mut claims: Value) -> Value {
-    let token = id_token.to_string();
-    let Some(payload) = token.split('.').nth(1) else {
-        return claims;
-    };
-    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
-        return claims;
-    };
-    let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(&bytes) else {
-        return claims;
-    };
-    if let Value::Object(map) = &mut claims {
-        for (key, value) in raw {
-            map.entry(key).or_insert(value);
-        }
-    }
-    claims
 }

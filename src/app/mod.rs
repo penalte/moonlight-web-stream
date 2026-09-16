@@ -629,7 +629,6 @@ impl App {
         Ok(role)
     }
 
-    /// Returns any role that is an Admin
     /// Aligns an OIDC user role with their group membership.
     ///
     /// Runs on every login, so granting or revoking the admin group in the
@@ -672,6 +671,7 @@ impl App {
         Ok(())
     }
 
+    /// Returns any role that is an Admin
     pub async fn admin_role(&self) -> Result<Role, AppError> {
         let result = self
             .find_role(async |role| {
